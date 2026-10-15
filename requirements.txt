@@ -1,0 +1,8 @@
+# Nexora — core dependencies
+requests>=2.28
+dnspython>=2.3
+aiohttp>=3.8          # async subdomain-takeover checks (takeover.py)
+cryptography>=41      # live TLS certificate SAN parsing
+
+# Optional:
+# pypdf>=4            # richer PDF/document metadata in `--deep`
