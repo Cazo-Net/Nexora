@@ -32,6 +32,7 @@ full = ["pypdf>=4", "phonenumbers>=8.13"]
 
 [project.scripts]
 nexora = "nexora.cli:main"
+nexconsole = "nexora.console:main"   # Metasploit-style interactive console
 osint = "nexora.cli:main"    # legacy alias
 
 [project.urls]
@@ -40,7 +41,7 @@ Repository = "https://github.com/Cazo-Net/Nexora"
 Issues = "https://github.com/Cazo-Net/Nexora/issues"
 
 [tool.setuptools]
-packages = ["nexora"]
+packages = ["nexora", "nexora.social"]
 py-modules = ["osint"]
 
 [tool.pytest.ini_options]

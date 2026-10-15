@@ -244,8 +244,57 @@ class IntelResult:
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
+_HTTP_CACHE_TTL = 300  # seconds; 0 disables the engine HTTP cache (watch mode)
+
+try:  # cache is optional — engine must work without the nexora package
+    from nexora.cache import cache_enabled as _cache_enabled
+    from nexora.cache import cache_get as _cache_get
+    from nexora.cache import cache_set as _cache_set
+except Exception:  # pragma: no cover
+    _cache_enabled = _cache_get = _cache_set = None  # type: ignore
+
+_MAX_CACHED_BODY = 1_000_000  # bytes
+
+
+class _CachedResponse:
+    """Minimal response object reconstructed from the HTTP cache."""
+
+    def __init__(self, data: dict) -> None:
+        self.status_code = int(data.get("status_code", 200))
+        self.headers = dict(data.get("headers") or {})
+        self.url = str(data.get("url") or "")
+        self.text = str(data.get("text") or "")
+        self.content = self.text.encode("utf-8", "ignore")
+        self.history: list = []
+        self.from_cache = True
+
+    def json(self):
+        import json as _json
+        return _json.loads(self.text)
+
+    def close(self) -> None:  # pragma: no cover - compatibility no-op
+        pass
+
+
 def _http_get(url: str, params: Optional[dict] = None, timeout: int = _TIMEOUT):
-    """HTTP GET using pooled session. Returns response or None on failure."""
+    """HTTP GET using pooled session. Returns response or None on failure.
+
+    Successful small responses are served from the shared TTL cache
+    (see ``nexora.cache``) when it is enabled.
+    """
+    cache_key = None
+    try:
+        if (_cache_get is not None and _HTTP_CACHE_TTL > 0
+                and _cache_enabled()):
+            cache_key = "engine:http:" + url
+            if params:
+                cache_key += "|" + "&".join(
+                    f"{k}={params[k]}" for k in sorted(params))
+            cached = _cache_get(cache_key, _HTTP_CACHE_TTL)
+            if isinstance(cached, dict) and "text" in cached:
+                return _CachedResponse(cached)
+    except Exception:
+        cache_key = None
     try:
         from urllib.parse import urlparse
         host = urlparse(url).hostname
@@ -262,6 +311,18 @@ def _http_get(url: str, params: Optional[dict] = None, timeout: int = _TIMEOUT):
                 url, params=params, headers=_USER_AGENT, timeout=timeout,
                 allow_redirects=True,
             )
+        if cache_key is not None and resp.status_code == 200:
+            try:
+                body = resp.text
+                if len(body.encode("utf-8", "ignore")) <= _MAX_CACHED_BODY:
+                    _cache_set(cache_key, {
+                        "status_code": resp.status_code,
+                        "url": getattr(resp, "url", "") or "",
+                        "headers": dict(resp.headers or {}),
+                        "text": body,
+                    })
+            except Exception:
+                pass
         return resp
     except Exception:
         if host:
@@ -277,6 +338,41 @@ def _dns_resolve(host: str, timeout: float = 3.0) -> list:
         return [("", 0, 0, "", (r.to_text(), 0)) for r in answers]
     except Exception:
         return []
+
+
+# --------------------------------------------------------------------------- #
+# Optional wordlist for DNS brute-force (CLI --wordlist / config)
+# --------------------------------------------------------------------------- #
+_EXTRA_BRUTE_PREFIXES: List[str] = []
+
+
+def set_wordlist(path: Optional[str] = None,
+                 words: Optional[list] = None) -> int:
+    """Load extra DNS brute-force prefixes (one per line in ``path``).
+
+    Returns the number of usable prefixes. Raises ``ValueError`` when no
+    valid prefix remains (empty file, comments only, ...).
+    """
+    global _EXTRA_BRUTE_PREFIXES
+    items: List[str] = []
+    if words:
+        items.extend(str(w).strip().lower() for w in words)
+    if path:
+        with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+            items.extend(line.strip().lower() for line in fh)
+    cleaned: List[str] = []
+    seen = set()
+    for w in items:
+        if not w or w.startswith("#") or w in seen:
+            continue
+        if not re.fullmatch(r"[a-z0-9._-]+", w):
+            continue
+        seen.add(w)
+        cleaned.append(w)
+    if not cleaned:
+        raise ValueError("no usable prefixes in wordlist")
+    _EXTRA_BRUTE_PREFIXES = cleaned[:5000]
+    return len(_EXTRA_BRUTE_PREFIXES)
 
 
 def _normalize_domain(raw: str) -> str:
@@ -700,7 +796,7 @@ def _collect_subdomains(domain: str, status: Dict[str, str]) -> List[SubdomainRe
             except Exception:
                 pass
 
-    # DNS brute-force (top 25, concurrent — fast timeout)
+    # DNS brute-force (top built-ins + optional user wordlist, concurrent)
     _DNS_PREFIXES = [
         "www", "mail", "ftp", "smtp", "webmail", "mx", "mx1", "mx2",
         "ns1", "ns2", "dns", "dns1", "dns2",
@@ -712,7 +808,11 @@ def _collect_subdomains(domain: str, status: Dict[str, str]) -> List[SubdomainRe
         "git", "jenkins",
         "status",
     ]
-    _brute_candidates = [f"{prefix}.{domain}" for prefix in _DNS_PREFIXES if f"{prefix}.{domain}" not in found]
+    _prefixes = list(_DNS_PREFIXES)
+    for _p in _EXTRA_BRUTE_PREFIXES:
+        if _p not in _prefixes:
+            _prefixes.append(_p)
+    _brute_candidates = [f"{prefix}.{domain}" for prefix in _prefixes if f"{prefix}.{domain}" not in found]
 
     def _try_brute(candidate: str) -> Optional[SubdomainResult]:
         try:

@@ -42,6 +42,52 @@ _session.mount("http://", _adapter)
 _DEAD_HOSTS: Dict[str, float] = {}
 _DEAD_HOST_TTL = 300
 
+# Optional politeness delay between requests to the same host (config [net]).
+_PER_HOST_DELAY = 0.0
+_LAST_REQ: Dict[str, float] = {}
+
+
+def apply_config(cfg: Optional[dict]) -> None:
+    """Apply the ``[net]`` section of the user config. Never raises.
+
+    Keys: ``proxy`` (http/https/socks5 URL), ``user_agent``,
+    ``per_host_delay`` (seconds between requests to one host).
+    Empty/invalid values keep the current defaults.
+    """
+    global USER_AGENT, _PER_HOST_DELAY
+    if not isinstance(cfg, dict):
+        return
+    ua = str(cfg.get("user_agent") or "").strip()
+    if ua:
+        USER_AGENT = {"User-Agent": ua}
+    proxy = str(cfg.get("proxy") or "").strip()
+    if proxy:
+        try:
+            _session.proxies.update({"http": proxy, "https": proxy})
+        except Exception:
+            pass
+    try:
+        delay = float(cfg.get("per_host_delay") or 0.0)
+        _PER_HOST_DELAY = delay if delay > 0 else 0.0
+    except (TypeError, ValueError):
+        pass
+
+
+def _throttle(host: Optional[str]) -> None:
+    """Best-effort per-host politeness delay (no-op unless configured)."""
+    if not _PER_HOST_DELAY or not host:
+        return
+    try:
+        last = _LAST_REQ.get(host)
+        now = time.monotonic()
+        if last is not None:
+            wait = _PER_HOST_DELAY - (now - last)
+            if wait > 0:
+                time.sleep(wait)
+        _LAST_REQ[host] = time.monotonic()
+    except Exception:
+        pass
+
 
 def _is_dead(host: Optional[str]) -> bool:
     if not host:
@@ -80,6 +126,7 @@ def http_get(
     host = urlparse(url).hostname
     if _is_dead(host):
         return None
+    _throttle(host)
     try:
         resp = _session.get(
             url, params=params, headers={**USER_AGENT, **(headers or {})},
@@ -109,6 +156,7 @@ def http_post(
     host = urlparse(url).hostname
     if _is_dead(host):
         return None
+    _throttle(host)
     try:
         return _session.post(
             url, data=data, json=json_body,
