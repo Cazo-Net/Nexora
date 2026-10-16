@@ -16,8 +16,13 @@
 
 **Advanced Internet Intelligence Engine** — key-free OSINT from the command line.
 Aggregates **25+ public sources** for domains, IPs, emails, URLs, ASNs, phones,
-and usernames. No API keys, ever. Every source degrades gracefully — a partial
-result is always returned.
+usernames, and social media identities. No API keys, ever. Every source degrades
+gracefully — a partial result is always returned.
+
+Includes **Nexconsole**, a Metasploit-style interactive framework
+(`use` / `set` / `run` / workspaces / findings database) and a **social media
+OSINT center** with cross-platform identity correlation, graphs, posts, media
+leak analysis, and brand impersonation detection.
 
 Works on **Kali Linux / any Linux distro** and **Windows** (Python 3.9+).
 
@@ -53,6 +58,7 @@ Verify:
 ```bash
 nexora --version        # Nexora 2.1.0
 nexora --help           # shows the banner + subcommands
+nexconsole --version    # Nexora Nexconsole 2.1.0
 ```
 
 No install? Run straight from the folder: `python3 -m nexora <args>` or the
@@ -71,12 +77,65 @@ nexora asn AS13335                        # ASN prefixes, peers, upstreams
 nexora url https://example.com            # redirect chain, TLS, header audit
 nexora phone +14155552671                 # offline number parsing, carrier, TZ
 
+# social media OSINT center
+nexora social identity octocat            # 30+ platforms + correlation score
+nexora social graph octocat               # followers, linked identities, link-outs
+nexora social posts octocat               # Reddit / HN / GitHub / Dev.to / Medium
+nexora social media handle:johndoe        # link-in-bio crawl + EXIF/GPS leaks
+nexora social media https://site/pic.jpg  # EXIF metadata / GPS location check
+nexora social brand stripe.com            # official accounts + impersonators
+
+# framework
+nexora console                            # interactive Nexconsole (or `nexconsole`)
+nexora sources                            # source catalog + cache/config status
+
 # machine-readable output
 nexora domain example.com --json -o report.json
 ```
 
 The startup banner can be turned off with `--no-banner` or
 `NEXORA_NO_BANNER=1` (it is automatically suppressed in `--json` mode).
+
+## Nexconsole — Metasploit-style framework
+
+```bash
+nexconsole            # or: nexora console
+```
+
+```
+nexora > show modules
+nexora (recon/domain) > use recon/domain
+nexora (recon/domain) > set target example.com
+nexora (recon/domain) > set profile quick
+nexora (recon/domain) > show options
+nexora (recon/domain) > run
+nexora > show findings
+nexora > workspace client-a
+nexora > search takeover
+nexora > notes add "checked with client"
+nexora > export report.json
+```
+
+* 14 built-in modules (`recon/*`, `social/*`, `util/*`) — lazy-loaded registry
+* **Workspaces** + SQLite findings DB (`~/.nexora/nexora.db`): hosts, services,
+  findings, evidence, notes — every `run` auto-ingests its results
+* Batch mode for scripting: `nexconsole -c "use recon/ip; set target 1.2.3.4; run"`
+  or `nexconsole -x commands.txt`
+* `set`/`setg`/`unset`/`show options`/`info`/`back`/`history` — msf muscle
+  memory works; unknown commands get `did you mean` suggestions
+
+## Social media OSINT center
+
+| Command | What it does |
+|---------|--------------|
+| `social identity <handle>` | Checks 30–105 platforms, pulls key-free profile metadata (GitHub, Reddit, Keybase, Steam, Linktree…), detects **avatar reuse & bio similarity**, and scores a 0–100 correlation verdict |
+| `social graph <handle>` | Nodes/edges: GitHub followers/following, Reddit communities, Keybase linked identities, link-in-bio destinations |
+| `social posts <handle>` | Public timelines — Reddit, Hacker News, GitHub events/gists, Dev.to, Medium RSS, Mastodon + dork suggestions for walled gardens |
+| `social media <target>` | Pure-Python **EXIF parser** — GPS coordinates, camera make/model, timestamps from images and page image sets; `handle:` mode crawls link-in-bio pages |
+| `social brand <domain>` | Scrapes official accounts from the homepage, then hunts **impersonation accounts** (`brand-support`, `brandofficial`…) across platforms |
+
+Walled gardens (X, Instagram, TikTok, Facebook) are never scraped — you get
+ready-made dork queries instead. Everything is key-free.
 
 ## Scan profiles
 
@@ -147,12 +206,17 @@ extra_fingerprints = [
 ## Architecture
 
 ```
-osint.py           engine: lookup_domain() + dataclasses + legacy CLI
+osint.py           engine: lookup_domain() + dataclasses + legacy CLI,
+                   HTTP TTL cache, wordlist-driven DNS brute-force
 takeover.py        async subdomain-takeover detection (app.engine.takeover copy)
 osint_advanced.py  advanced collectors + risk scoring (app.engine.* copy)
-nexora/            the suite: cli, banner, config, cache, net, output,
-                   profiles, ip, email, username, url, asn, phone, deep,
-                   advanced (fallback), takeover (fallback)
+nexora/            the suite:
+                     cli, banner, config, cache, net, output, profiles,
+                     ip, email, username, url, asn, phone, deep,
+                     console   Nexconsole REPL
+                     modules   lazy module registry (14 built-ins)
+                     store     SQLite workspace/findings DB
+                     social/   identity, graph, posts, media, brand
 tests/             pytest suite (fully offline, mocked HTTP/DNS)
 ```
 
@@ -167,7 +231,7 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-All tests are hermetic — no network access is required (or allowed).
+237 tests, all hermetic — no network access is required (or allowed).
 
 ## Legal
 
