@@ -27,3 +27,7 @@ Thumbs.db
 # Nexora runtime artifacts (state + cache live under ~/.nexora, but be safe)
 *.log
 .nexora/
+
+# personal documents accidentally placed in project root
+Structure.pdf
+_EBM.Lincoln.Dec.2025.pptx
