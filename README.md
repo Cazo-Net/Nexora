@@ -71,11 +71,11 @@ nexora example.com                        # subcommand auto-detected
 nexora domain stripe                      # company name → domain via Wikidata
 nexora domain example.com --profile full  # + deep recon
 nexora ip 8.8.8.8                         # RDAP, BGP, reputation, Shodan, ports
-nexora email admin@example.com            # MX/SPF/DMARC/DKIM, gravatar, breaches
-nexora username torvalds                  # 105-site enumeration + enrichments
+nexora email admin@example.com            # DNS security, breaches, connected platforms, RDAP
+nexora username torvalds                  # 105 sites + enrichment + identifier pivots
 nexora asn AS13335                        # ASN prefixes, peers, upstreams
 nexora url https://example.com            # redirect chain, TLS, header audit
-nexora phone +14155552671                 # offline number parsing, carrier, TZ
+nexora phone +14155552671                 # parsing, carrier, TZ + messaging platform map
 
 # social media OSINT center
 nexora social identity octocat            # 30+ platforms + correlation score
@@ -231,7 +231,7 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-237 tests, all hermetic — no network access is required (or allowed).
+252 tests, all hermetic — no network access is required (or allowed).
 
 ## Legal
 

@@ -14,6 +14,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .net import reset_circuit_breaker
 from .output import c, header
+from .platforms import platforms_for_phone
 
 try:
     import phonenumbers
@@ -175,6 +176,21 @@ def _guess_country(raw: str) -> Optional[str]:
     return None
 
 
+def _attach_platforms(target: str, e164: Optional[str],
+                      national: Optional[str],
+                      sources_status: Dict[str, str],
+                      status_cb: Optional[Callable[..., None]]) -> Dict[str, Any]:
+    """Connected-platform map (deep links, dorks) — never raises."""
+    try:
+        plat = platforms_for_phone(target, e164=e164, national=national,
+                                   status_cb=status_cb)
+    except ValueError:
+        plat = {"platforms": [], "dorks": [], "handle_candidates": [],
+                "sources_status": {"platform-map": "skipped: not number-ish"}}
+    sources_status.update(plat.get("sources_status") or {})
+    return plat
+
+
 # --------------------------------------------------------------------------- #
 # Public API
 # --------------------------------------------------------------------------- #
@@ -196,6 +212,7 @@ def lookup_phone(phone: str, *, status_cb: Optional[Callable[..., None]] = None)
         guess = _guess_country(target)
         sources_status["parser"] = "skipped: phonenumbers not installed"
         _notify(status_cb, "parser", {"status": sources_status["parser"]})
+        plat = _attach_platforms(target, None, None, sources_status, status_cb)
         return {
             "phone": target,
             "e164": None,
@@ -216,6 +233,9 @@ def lookup_phone(phone: str, *, status_cb: Optional[Callable[..., None]] = None)
             "requires": "pip install phonenumbers",
             "digits": digits,
             "country_guess": guess,
+            "connected_platforms": plat.get("platforms") or [],
+            "dorks": plat.get("dorks") or [],
+            "handle_candidates": plat.get("handle_candidates") or [],
             "sources_status": sources_status,
         }
 
@@ -245,6 +265,8 @@ def lookup_phone(phone: str, *, status_cb: Optional[Callable[..., None]] = None)
             timezones = []
         sources_status["parser"] = "ok"
         _notify(status_cb, "parser", {"status": "ok", "detail": e164})
+        plat = _attach_platforms(target, e164, national, sources_status,
+                                 status_cb)
         return {
             "phone": target,
             "e164": e164,
@@ -263,6 +285,9 @@ def lookup_phone(phone: str, *, status_cb: Optional[Callable[..., None]] = None)
             "location": location,
             "timezones": timezones,
             "requires": None,
+            "connected_platforms": plat.get("platforms") or [],
+            "dorks": plat.get("dorks") or [],
+            "handle_candidates": plat.get("handle_candidates") or [],
             "sources_status": sources_status,
         }
     except ValueError:
@@ -270,6 +295,7 @@ def lookup_phone(phone: str, *, status_cb: Optional[Callable[..., None]] = None)
     except Exception as e:  # library internals must never crash the CLI
         sources_status["parser"] = f"error: {type(e).__name__}"
         _notify(status_cb, "parser", {"status": sources_status["parser"]})
+        plat = _attach_platforms(target, None, None, sources_status, status_cb)
         return {
             "phone": target,
             "e164": None, "international": None, "national": None,
@@ -277,7 +303,11 @@ def lookup_phone(phone: str, *, status_cb: Optional[Callable[..., None]] = None)
             "region": None, "country": None, "country_code": None,
             "national_number": None, "number_type": None, "is_mobile": False,
             "carrier": None, "location": None, "timezones": [],
-            "requires": None, "sources_status": sources_status,
+            "requires": None,
+            "connected_platforms": plat.get("platforms") or [],
+            "dorks": plat.get("dorks") or [],
+            "handle_candidates": plat.get("handle_candidates") or [],
+            "sources_status": sources_status,
         }
 
 
@@ -340,6 +370,37 @@ def render_text(result: Dict[str, Any]) -> None:
         print(f"  Location      {result.get('location') or '-'}")
         timezones = result.get("timezones") or []
         print(f"  Timezones     {', '.join(timezones) if timezones else '-'}")
+
+    # -------------------------------------------------- CONNECTED PLATFORMS
+    header("CONNECTED PLATFORMS")
+    plats = result.get("connected_platforms") or []
+    if not plats:
+        print(f"  {c('gray')}(no platform map for this number){c('reset')}")
+    else:
+        for p in plats:
+            if not isinstance(p, dict):
+                continue
+            print(f"  {c('cyan')}{str(p.get('platform') or '?'):<10}{c('reset')}"
+                  f"{str(p.get('method') or ''):<12} {c('gray')}"
+                  f"{p.get('url') or '-'}{c('reset')}")
+            if p.get("note"):
+                print(f"    {c('dim')}{p['note']}{c('reset')}")
+
+    # --------------------------------------------------------- SEARCH DORKS
+    header("SEARCH DORKS")
+    dorks = result.get("dorks") or []
+    if dorks:
+        for d in dorks:
+            print(f"  {c('gray')}{d}{c('reset')}")
+    else:
+        print(f"  {c('gray')}(none){c('reset')}")
+
+    # ---------------------------------------------------- HANDLE CANDIDATES
+    cands = result.get("handle_candidates") or []
+    if cands:
+        header("HANDLE CANDIDATES")
+        print(f"  {c('gray')}{', '.join(cands)}"
+              f"  (heuristic — try as username){c('reset')}")
 
     header("SOURCE STATUS")
     statuses = result.get("sources_status") or {}

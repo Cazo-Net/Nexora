@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .advanced import _collect_email_security
-from .net import http_get, reset_circuit_breaker
+from .net import http_get, reset_circuit_breaker, resolve_txt
 from .output import c, header
 
 _EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
@@ -188,6 +188,97 @@ def _collect_disposable(domain: str) -> Tuple[Optional[bool], str, str]:
     return is_disp, status, "disposable" if is_disp else "legitimate domain"
 
 
+def _collect_platforms(email: str, sources_status: Dict[str, str]
+                       ) -> Tuple[Optional[Dict[str, Any]], str, str]:
+    """Find internet platforms connected to this address (nexora.platforms).
+
+    Uses the module-level ``http_get`` so tests that patch it stay inert.
+    """
+    try:
+        from .platforms import platforms_for_email
+        bundle = platforms_for_email(email, getter=http_get)
+    except ValueError as e:
+        sources_status["platforms"] = "error: invalid_input"
+        return None, sources_status["platforms"], str(e)[:80]
+    except Exception as e:
+        sources_status["platforms"] = f"error: {type(e).__name__}"
+        return None, sources_status["platforms"], str(e)[:80]
+    for key, value in (bundle.get("sources_status") or {}).items():
+        sources_status[f"pf-{key}"] = value
+    count = int(bundle.get("platform_count") or 0)
+    status = "ok" if count else "no_results"
+    detail = f"{count} platform link(s)"
+    return bundle, status, detail
+
+
+def _collect_rdap(domain: str) -> Tuple[Optional[Dict[str, Any]], str, str]:
+    """Registry record via RDAP (org, registrar, dates, abuse contact)."""
+    resp = http_get(f"https://rdap.org/domain/{domain}", timeout=10)
+    if resp is None:
+        return None, "error: no_response", "RDAP unreachable"
+    if resp.status_code == 404:
+        return None, "no_results", "no registry data for this domain"
+    if resp.status_code != 200:
+        return None, f"http_{resp.status_code}", ""
+    try:
+        data = resp.json() or {}
+    except Exception:
+        return None, "error: invalid_json", ""
+    if not isinstance(data, dict):
+        return None, "no_results", ""
+
+    out: Dict[str, Any] = {"domain": domain}
+    events = {str(ev.get("eventAction") or ""): str(ev.get("eventDate") or "")
+              for ev in (data.get("events") or []) if isinstance(ev, dict)}
+    out["created"] = events.get("registration") or None
+    out["updated"] = events.get("last changed") or events.get("last update") or None
+    statuses = [str(s) for s in (data.get("status") or [])]
+    out["statuses"] = statuses[:8]
+
+    def _vcard(entity: Dict[str, Any], key: str) -> Optional[str]:
+        try:
+            for item in (entity.get("vcardArray") or [None, []])[1]:
+                if isinstance(item, list) and len(item) >= 4 and item[0] == key:
+                    value = item[3]
+                    if isinstance(value, list):
+                        value = " ".join(str(v) for v in value if v)
+                    return _clip(str(value), 80) or None
+        except Exception:
+            return None
+        return None
+
+    for entity in (data.get("entities") or []):
+        if not isinstance(entity, dict):
+            continue
+        roles = [str(r).lower() for r in (entity.get("roles") or [])]
+        if "registrar" in roles and not out.get("registrar"):
+            out["registrar"] = _vcard(entity, "fn")
+        if "registrant" in roles and not out.get("registrant_org"):
+            out["registrant_org"] = _vcard(entity, "fn")
+        if "abuse" in roles and not out.get("abuse_email"):
+            out["abuse_email"] = _vcard(entity, "email")
+            out["abuse_name"] = _vcard(entity, "fn")
+
+    known = bool(out.get("registrar") or out.get("registrant_org")
+                 or out.get("created") or out.get("abuse_email"))
+    if not known:
+        return None, "no_results", "registry record without entity data"
+    detail = out.get("registrar") or out.get("registrant_org") or "registry data"
+    return out, "ok", _clip(str(detail), 60)
+
+
+def _collect_bimi(domain: str) -> Tuple[Optional[Dict[str, Any]], str, str]:
+    """BIMI record (brand logo alignment) — DNS only."""
+    try:
+        records = resolve_txt(f"default._bimi.{domain}")
+    except Exception as e:
+        return None, f"error: {type(e).__name__}", ""
+    for record in records or []:
+        if str(record).lower().startswith("v=bimi1"):
+            return {"record": _clip(str(record), 120)}, "ok", "BIMI published"
+    return None, "no_results", "no BIMI record"
+
+
 def _username_guesses(local: str) -> List[str]:
     candidates = [
         local,
@@ -231,6 +322,10 @@ def lookup_email(email: str, *,
         ("gravatar", "gravatar", lambda: _collect_gravatar(email)),
         ("breach-check", "breach_check", lambda: _collect_breach(email)),
         ("disposable", "is_disposable", lambda: _collect_disposable(domain)),
+        ("platforms", "_platforms_bundle",
+         lambda: _collect_platforms(email, sources_status)),
+        ("rdap", "rdap", lambda: _collect_rdap(domain)),
+        ("bimi", "bimi", lambda: _collect_bimi(domain)),
     ]
 
     result: Dict[str, Any] = {
@@ -242,10 +337,14 @@ def lookup_email(email: str, *,
         "email_security": None,
         "gravatar": None,
         "breach_check": None,
+        "connected_platforms": [],
+        "dorks": [],
+        "rdap": None,
+        "bimi": None,
         "sources_status": sources_status,
     }
 
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    with ThreadPoolExecutor(max_workers=8) as pool:
         futures = {pool.submit(fn): (name, key) for name, key, fn in tasks}
         for fut in as_completed(futures):
             name, key = futures[fut]
@@ -257,6 +356,12 @@ def lookup_email(email: str, *,
                 sources_status[name] = status
             result[key] = value
             _notify(status_cb, name, {"status": status, "detail": detail})
+
+    # Flatten the platform bundle into first-class result keys.
+    bundle = result.pop("_platforms_bundle", None)
+    if isinstance(bundle, dict):
+        result["connected_platforms"] = bundle.get("platforms") or []
+        result["dorks"] = bundle.get("dorks") or []
 
     return result
 
@@ -356,6 +461,12 @@ def render_text(result: Dict[str, Any]) -> None:
         for issue in (es.get("issues") or []):
             print(f"  {c('yellow')}! {issue}{c('reset')}")
 
+    # BIMI lives in the result (not the DNS-security block) — show whenever present
+    bimi = result.get("bimi")
+    if bimi and bimi.get("record"):
+        print(f"  BIMI          {c('green')}{_clip(bimi['record'], 60)}"
+              f"{c('reset')}")
+
     # ------------------------------------------------------------- GRAVATAR
     header("GRAVATAR")
     gv = result.get("gravatar") or {}
@@ -393,6 +504,63 @@ def render_text(result: Dict[str, Any]) -> None:
     else:
         print(f"  {c('gray')}unavailable ({status or 'unknown'}){c('reset')}")
 
+    # -------------------------------------------------- CONNECTED PLATFORMS
+    header("CONNECTED PLATFORMS")
+    plist = result.get("connected_platforms") or []
+    if not plist:
+        print(f"  {c('gray')}(no key-free platform links found — "
+              f"try the dorks below){c('reset')}")
+    else:
+        for p in plist:
+            if not isinstance(p, dict):
+                continue
+            plat = str(p.get("platform") or "?")
+            handle = p.get("handle")
+            url = p.get("url") or "-"
+            verified = p.get("verified")
+            if verified is True:
+                mark, col = _checkmark(), c("green")
+            elif verified is False:
+                mark, col = "!", c("yellow")
+            else:
+                mark, col = "-", c("cyan")
+            print(f"  {mark} {c('bold')}{plat:<16}{c('reset')}"
+                  f"{_clip(str(handle or '-'), 28):<30} {c('gray')}"
+                  f"{_clip(url, 58)}{c('reset')}")
+            if p.get("evidence"):
+                print(f"    {c('dim')}{_clip(p['evidence'], 80)}{c('reset')}")
+
+    # ----------------------------------------------------------- SEARCH DORKS
+    header("SEARCH DORKS")
+    dorks = result.get("dorks") or []
+    if dorks:
+        for d in dorks:
+            print(f"  {c('gray')}{d}{c('reset')}")
+    else:
+        print(f"  {c('gray')}(none){c('reset')}")
+
+    # ----------------------------------------------------- DOMAIN REGISTRY
+    header("DOMAIN REGISTRY (RDAP)")
+    rdap = result.get("rdap") or {}
+    if not rdap:
+        print(f"  {c('gray')}(no registry data){c('reset')}")
+    else:
+        if rdap.get("registrar"):
+            print(f"  Registrar     {rdap['registrar']}")
+        if rdap.get("registrant_org"):
+            print(f"  Registrant    {rdap['registrant_org']}")
+        if rdap.get("created"):
+            print(f"  Created       {rdap['created']}")
+        if rdap.get("updated"):
+            print(f"  Updated       {rdap['updated']}")
+        if rdap.get("abuse_email"):
+            print(f"  Abuse contact {c('yellow')}{rdap['abuse_email']}"
+                  f"{c('reset')}"
+                  + (f"  ({rdap['abuse_name']})" if rdap.get("abuse_name") else ""))
+        if rdap.get("statuses"):
+            print(f"  Statuses      {c('gray')}{', '.join(rdap['statuses'])}"
+                  f"{c('reset')}")
+
     # ----------------------------------------------------- USERNAME GUESSES
     header("USERNAME GUESSES")
     guesses = result.get("username_guesses") or []
@@ -406,4 +574,4 @@ def render_text(result: Dict[str, Any]) -> None:
     statuses = result.get("sources_status") or {}
     for name in sorted(statuses):
         value = str(statuses[name])
-        print(f"  {name:<16}{_status_color(value)}{value}{c('reset')}")
+        print(f"  {name:<18}{_status_color(value)}{value}{c('reset')}")

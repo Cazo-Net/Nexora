@@ -32,6 +32,8 @@ def _patch_network(monkeypatch):
     monkeypatch.setattr(email_mod, "_collect_email_security", fake_collect)
     monkeypatch.setattr(email_mod, "http_get",
                         lambda *args, **kwargs: None)
+    monkeypatch.setattr(email_mod, "resolve_txt",
+                        lambda *args, **kwargs: [])
 
 
 def test_lookup_email_hermetic(monkeypatch):

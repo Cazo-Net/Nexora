@@ -15,14 +15,25 @@ with colors disabled.
 from __future__ import annotations
 
 import re
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 from .net import http_get, reset_circuit_breaker
 from .output import c, header
+from .platforms import username_dorks
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,40}$")
+
+
+def _checkmark() -> str:
+    """A ✓ that degrades to ASCII on consoles that can't encode it."""
+    try:
+        "\u2713".encode(sys.stdout.encoding or "ascii")
+        return "\u2713"
+    except Exception:
+        return "[ok]"
 
 # --------------------------------------------------------------------------- #
 # Site catalogue: {"name", "url" (with {u} placeholder), "category",
@@ -154,12 +165,13 @@ _AMBIGUOUS = (400, 401, 403, 405, 429, 999, 301, 302, 307, 308)
 
 # Field display order per enriched profile
 _PROFILE_FIELDS: Dict[str, List[str]] = {
-    "GitHub": ["name", "bio", "location", "company", "blog",
-               "public_repos", "followers"],
+    "GitHub": ["name", "bio", "location", "company", "blog", "email",
+               "twitter_username", "public_repos", "followers"],
     "Reddit": ["display_name", "link_karma", "total_karma",
                "created_utc", "public_description"],
     "Dev.to": ["name", "location", "summary", "github_username",
                "twitter_username"],
+    "Keybase": ["username", "linked_accounts"],
 }
 
 
@@ -228,7 +240,7 @@ def _enrich_github(u: str) -> Dict[str, Any]:
             return {"_status": "error: bad_json"}
         if not isinstance(data, dict):
             return {"_status": "error: bad_json"}
-        keys = ("name", "bio", "company", "location", "blog",
+        keys = ("name", "bio", "company", "location", "blog", "email",
                 "twitter_username", "public_repos", "followers",
                 "following", "created_at", "avatar_url", "html_url")
         out: Dict[str, Any] = {k: data.get(k) for k in keys}
@@ -322,6 +334,52 @@ def _enrich_devto(u: str) -> Dict[str, Any]:
                 pass
 
 
+def _enrich_keybase(u: str) -> Dict[str, Any]:
+    """Keybase profile + verified cross-platform proofs for a handle."""
+    resp = None
+    try:
+        resp = http_get("https://keybase.io/_/api/1.0/user/lookup.json",
+                        params={"username": u}, timeout=8)
+        if resp is None:
+            return {"_status": "error: no_response"}
+        if resp.status_code == 404:
+            return {"_status": "no_results"}
+        if resp.status_code != 200:
+            return {"_status": f"http_{resp.status_code}"}
+        try:
+            data = resp.json()
+        except Exception:
+            return {"_status": "error: bad_json"}
+        them = (data or {}).get("them") or []
+        if not them:
+            return {"_status": "no_results"}
+        user = them[0] if isinstance(them[0], dict) else {}
+        linked: List[Dict[str, Any]] = []
+        for proof in (user.get("proofs") or []):
+            if not isinstance(proof, dict):
+                continue
+            ptype = str(proof.get("proof_type") or "").strip().lower()
+            if not ptype or ptype in ("dns", "http"):
+                continue
+            linked.append({
+                "platform": ptype,
+                "handle": str(proof.get("nametracker_payload") or "")[:60],
+                "url": str(proof.get("url") or "")[:200],
+                "verified": bool(proof.get("verified")),
+            })
+        return {"_status": "ok",
+                "username": user.get("username"),
+                "linked_accounts": linked}
+    except Exception as exc:
+        return {"_status": f"error: {type(exc).__name__}"}
+    finally:
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+
 def lookup_username(username: str, *, concurrency: int = 25,
                     timeout: int = 6,
                     status_cb: Optional[Callable[[str, dict], None]] = None) -> dict:
@@ -362,11 +420,12 @@ def lookup_username(username: str, *, concurrency: int = 25,
     # ---- 2. optional profile enrichment (concurrent, silent-fail) ---------
     profiles: Dict[str, dict] = {}
     sources_status: Dict[str, str] = {}
-    with ThreadPoolExecutor(max_workers=3) as pool:
+    with ThreadPoolExecutor(max_workers=4) as pool:
         futures2 = {
             pool.submit(_enrich_github, u): ("GitHub", "enrich-github"),
             pool.submit(_enrich_reddit, u): ("Reddit", "enrich-reddit"),
             pool.submit(_enrich_devto, u): ("Dev.to", "enrich-devto"),
+            pool.submit(_enrich_keybase, u): ("Keybase", "enrich-keybase"),
         }
         for fut in as_completed(futures2):
             site_name, status_key = futures2[fut]
@@ -397,6 +456,56 @@ def lookup_username(username: str, *, concurrency: int = 25,
 
     sources_status["profile-checks"] = f"{len(found)}/{len(checks)} found"
 
+    # ---- 4. identifier pivots: emails, linked accounts, websites ----------
+    emails_found: List[Dict[str, Any]] = []
+    linked_accounts: List[Dict[str, Any]] = []
+    websites: List[Dict[str, Any]] = []
+    seen_keys = set()
+
+    def _pivot_email(addr: Any, source: str) -> None:
+        if isinstance(addr, str) and "@" in addr:
+            key = ("email", addr.lower())
+            if key not in seen_keys:
+                seen_keys.add(key)
+                emails_found.append({"email": addr, "source": source})
+
+    def _pivot_account(platform: Any, handle: Any, via: str,
+                       url: str = "") -> None:
+        if not isinstance(platform, str) or not isinstance(handle, str):
+            return
+        platform, handle = platform.strip().lower(), handle.strip()
+        if not platform or not handle:
+            return
+        if platform == "github" and handle.lower() == u.lower():
+            return  # the searched handle itself is not a pivot
+        key = ("account", platform, handle.lower())
+        if key not in seen_keys:
+            seen_keys.add(key)
+            linked_accounts.append({"platform": platform, "handle": handle,
+                                    "via": via, "url": url or None})
+
+    def _pivot_site(url: Any, source: str) -> None:
+        if isinstance(url, str) and url.startswith("http"):
+            key = ("site", url)
+            if key not in seen_keys:
+                seen_keys.add(key)
+                websites.append({"url": url, "source": source})
+
+    gh = profiles.get("GitHub") or {}
+    _pivot_email(gh.get("email"), "github")
+    _pivot_account("twitter", gh.get("twitter_username"), "github")
+    _pivot_site(gh.get("blog"), "github")
+
+    dt = profiles.get("Dev.to") or {}
+    _pivot_account("twitter", dt.get("twitter_username"), "dev.to")
+    _pivot_account("github", dt.get("github_username"), "dev.to")
+
+    kb = profiles.get("Keybase") or {}
+    for proof in (kb.get("linked_accounts") or []):
+        if isinstance(proof, dict):
+            _pivot_account(proof.get("platform"), proof.get("handle"),
+                           "keybase", str(proof.get("url") or ""))
+
     return {
         "username": u,
         "checks": checks,
@@ -406,6 +515,10 @@ def lookup_username(username: str, *, concurrency: int = 25,
         "unknown_count": unknown_count,
         "profiles": profiles,
         "avatars": avatars,
+        "emails_found": emails_found,
+        "linked_accounts": linked_accounts,
+        "websites": websites,
+        "dorks": username_dorks(u),
         "sources_status": sources_status,
     }
 
@@ -461,6 +574,38 @@ def render_text(result: dict) -> None:
                 print(f"    {c('cyan')}{key}{c('reset')}: {val}")
     else:
         print(f"  {c('gray')}none{c('reset')}")
+
+    # IDENTIFIER PIVOTS
+    header("IDENTIFIER PIVOTS")
+    emails_found = result.get("emails_found") or []
+    linked_accounts = result.get("linked_accounts") or []
+    websites = result.get("websites") or []
+    if not (emails_found or linked_accounts or websites):
+        print(f"  {c('gray')}(no public identifiers found){c('reset')}")
+    else:
+        for e in emails_found:
+            print(f"  {c('green')}email{c('reset')}     {e.get('email')}"
+                  f"  {c('dim')}(via {e.get('source')}){c('reset')}")
+        for acc in linked_accounts:
+            mark = _checkmark() if acc.get("url") else "-"
+            print(f"  {c('cyan')}{mark} account{c('reset')} {acc.get('platform')}: "
+                  f"{acc.get('handle')}"
+                  f"  {c('dim')}(via {acc.get('via')}){c('reset')}")
+        for w in websites:
+            print(f"  {c('gray')}website  {w.get('url')}"
+                  f"  (via {w.get('source')}){c('reset')}")
+        if emails_found:
+            print(f"  {c('dim')}\u2192 pivot: nexora email {emails_found[0].get('email')}"
+                  f" for the full address report{c('reset')}")
+
+    # SEARCH DORKS
+    header("SEARCH DORKS")
+    dorks = result.get("dorks") or []
+    if dorks:
+        for d in dorks:
+            print(f"  {c('gray')}{d}{c('reset')}")
+    else:
+        print(f"  {c('gray')}(none){c('reset')}")
 
     # AVATARS
     header("AVATARS")
